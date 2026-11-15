@@ -735,10 +735,45 @@ const mpLog=t=>{MPS.log.push(t);if(MPS.log.length>8)MPS.log.shift();say(t)};
 function mpPeers(){if(!MPS.on||!MPS.room)return[];const r=[];for(const p of MPS.room.peers()){if(p.isMe)continue;const q=p.presence||{};if(typeof q.n!=="string"||!q.n)continue;const x=+q.x,y=+q.y;if(!isFinite(x)||!isFinite(y))continue;r.push({peer:p.peer,n:cln(q.n,16),z:typeof q.z==="string"&&MP[q.z]?q.z:"o",x,y,f:q.f<0?-1:1,mv:q.mv?1:0,hp:+q.hp||0,mh:+q.mh||100,lv:q.lv|0,ss:q.ss?1:0,h:q.h?1:0,c:cln(q.c,60),ct:q.ct|0})}return r}
 function mpSync(){const ps=mpPeers(),ids=new Set(ps.map(p=>p.peer));for(const p of ps){const s=MPS.seen[p.peer];if(!s){MPS.seen[p.peer]={ct:p.ct};mpLog("🌐 "+p.n+" se unió a la sala");continue}if(p.ct!==s.ct){s.ct=p.ct;if(p.c){MPS.bub[p.peer]={t:p.c,e:frame+260};mpLog("💬 "+p.n+": "+p.c)}}}
  for(const k in MPS.seen)if(!ids.has(k)){mpLog("🌐 Un jugador salió de la sala");delete MPS.seen[k];delete MPS.disp[k];delete MPS.bub[k]}}
+/* ===== Multijugador sin Claude: conexión directa entre navegadores (PeerJS/WebRTC) ===== */
+function loadPeerJS(){return new Promise((ok,no)=>{if(window.Peer)return ok();const s=document.createElement("script");s.src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js";s.onload=()=>window.Peer?ok():no(0);s.onerror=()=>no(0);document.head.appendChild(s);setTimeout(()=>no(0),10000)})}
+const P2K=["n","z","x","y","f","mv","hp","mh","lv","ss","h","c","ct"];
+const p2c=d=>{const r={};if(d&&typeof d==="object")for(const k of P2K)if(k in d)r[k]=d[k];return r};
+async function p2pJoin(code,host){
+ await loadPeerJS();
+ const base="plazarpg-"+code.toLowerCase();
+ const st={me:{},others:Object.create(null),cbs:new Set(),conns:new Map(),up:null,pr:null,id:""};
+ const fire=()=>st.cbs.forEach(f=>{try{f()}catch(_){}});
+ const sendAll=(m,except)=>{for(const[id,c]of st.conns)if(id!==except){try{c.send(m)}catch(_){}}};
+ const room={
+  peers:()=>[{isMe:true,peer:st.id,presence:st.me}].concat(Object.keys(st.others).map(k=>({peer:k,presence:st.others[k]}))),
+  presence:d=>{Object.assign(st.me,p2c(d));const m={t:"p",id:st.id,d:p2c(d)};if(host)sendAll(m);else if(st.up){try{st.up.send(m)}catch(_){}}return Promise.resolve()},
+  onPeers:f=>{st.cbs.add(f);return()=>st.cbs.delete(f)},
+  leave:async()=>{try{st.pr.destroy()}catch(_){}}
+ };
+ await new Promise((ok,no)=>{
+  const t=setTimeout(()=>no(new Error("timeout")),12000);
+  const pr=new Peer(host?base:undefined,{debug:0});st.pr=pr;
+  pr.on("error",e=>{clearTimeout(t);no(e)});
+  pr.on("open",id=>{st.id=id;
+   if(host){clearTimeout(t);ok();return}
+   const c=pr.connect(base,{reliable:true,serialization:"json"});st.up=c;
+   c.on("open",()=>{clearTimeout(t);ok()});
+   c.on("data",m=>{if(!m||typeof m!=="object")return;
+    if(m.t==="full"&&m.o&&typeof m.o==="object"){st.others=Object.create(null);for(const k in m.o)if(k!==st.id)st.others[k]=p2c(m.o[k]);fire()}
+    else if(m.t==="p"&&typeof m.id==="string"&&m.id!==st.id){st.others[m.id]=Object.assign(st.others[m.id]||{},p2c(m.d));fire()}
+    else if(m.t==="gone"&&typeof m.id==="string"){delete st.others[m.id];fire()}});
+   c.on("close",()=>{st.others=Object.create(null);fire()});c.on("error",()=>{})});
+  if(host)pr.on("connection",c=>{
+   c.on("open",()=>{st.conns.set(c.peer,c);const o={};o[st.id]=st.me;for(const k in st.others)o[k]=st.others[k];try{c.send({t:"full",o})}catch(_){}});
+   c.on("data",m=>{if(!m||m.t!=="p"||!m.d||typeof m.d!=="object")return;const d=p2c(m.d);st.others[c.peer]=Object.assign(st.others[c.peer]||{},d);sendAll({t:"p",id:c.peer,d},c.peer);fire()});
+   const gone=()=>{if(!st.conns.has(c.peer))return;st.conns.delete(c.peer);delete st.others[c.peer];sendAll({t:"gone",id:c.peer});fire()};
+   c.on("close",gone);c.on("error",gone)});
+ });
+ return room}
 async function mpStart(code,host){if(MPS.on)await mpLeave();MPS.code=code;MPS.host=host?1:0;
  try{const cl=window.claude;const ns=cl&&cl.use?await Promise.race([cl.use("room"),new Promise(r=>setTimeout(()=>r(null),8000))]):null;
-  if(!ns||!ns.join){MPS.code="";mpLog("Multijugador no disponible acá: abrí el juego desde el link con tu cuenta. Jugás solo.");return false}
-  const rm=await ns.join("plaza-"+code.toLowerCase());MPS.room=rm;MPS.on=1;MPS.cur={};MPS.last="";MPS.seen={};
+  const rm=ns&&ns.join?await ns.join("plaza-"+code.toLowerCase()):await p2pJoin(code,host);MPS.room=rm;MPS.on=1;MPS.cur={};MPS.last="";MPS.seen={};
   MPS.offs.push(rm.onPeers(()=>mpSync()));
   say("🌐 Sala "+code+" abierta");
   if(!host)setTimeout(()=>{if(MPS.on&&mpPeers().length===0)say("Todavía no hay nadie en la sala "+MPS.code+". ¿El código es correcto?")},4000);
@@ -753,7 +788,7 @@ function mpDraw(){if(!MPS.on)return[];return mpPeers().filter(p=>p.z===cur).map(
   const b=MPS.bub[p.peer];if(b&&b.e>frame){g.font="bold 8px monospace";const w=Math.min(150,g.measureText(b.t).width+8);F(g,"#fffe",cx-w/2,cy-20,w,11);g.fillStyle="#222";g.fillText(b.t.slice(0,26),cx,cy-12)}}}})}
 const canGo=z=>({o:1,r:P.paid,z:mq>=1,v:mq>=1,t:bossDead,j:boss2Dead})[z];
 function mpMenu(){state="menu";
- if(!MPS.on){mnShow("🌐 MULTIJUGADOR","<p>Jugá con amigos en una sala privada: creá una sala y pasales el código, o entrá con el código de otro jugador.</p><p class='msg'>Todos tienen que abrir este mismo juego (link compartido) con su cuenta.</p>",[["Crear sala nueva",async()=>{mnShow("🌐","<p>Creando sala…</p>",[]);await mpStart(mpCode(),1);mpMenu()}],["Unirme con código",mpJoinMenu],["Volver",pauseMenu]]);return}
+ if(!MPS.on){mnShow("🌐 MULTIJUGADOR","<p>Jugá con amigos en una sala privada: creá una sala y pasales el código, o entrá con el código de otro jugador.</p><p class='msg'>Todos tienen que abrir este mismo juego (el mismo link) y estar conectados a internet.</p>",[["Crear sala nueva",async()=>{mnShow("🌐","<p>Creando sala…</p>",[]);await mpStart(mpCode(),1);mpMenu()}],["Unirme con código",mpJoinMenu],["Volver",pauseMenu]]);return}
  const ps=mpPeers(),b=[];let h="<p>Código de sala: <b style='font-size:20px;letter-spacing:3px'>"+esc(MPS.code)+"</b></p><p class='msg'>Pasale este código a tus amigos.</p>";
  h+=ps.length?ps.map(p=>"<p>"+(p.h?"👑 ":"🙂 ")+esc(p.n)+" · Nv "+p.lv+" · "+esc(ZN[p.z]||"?")+"</p>").join(""):"<p>Todavía estás solo en la sala…</p>";
  for(const p of ps)if(canGo(p.z)&&(p.z!==cur))b.push(["Ir con "+p.n,()=>{warp(p.z,p.x,p.y);mnClose();state="play"}]);
